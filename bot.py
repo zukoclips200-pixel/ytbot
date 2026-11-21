@@ -190,16 +190,18 @@ class ClipBot(discord.Client):
         cid = int(self.db.get_cfg(key) or 0)
         return self.get_channel(cid) if cid else None
 
-    async def ensure_channels(self, g: discord.Guild):
+        async def ensure_channels(self, g: discord.Guild):
+        """Reuses the YT Clipper channels that already exist, so a restart doesn't make new ones."""
         ow = self.channel_overwrites(g)
-        cat = self.chan("category_id")
+        cat = self.chan("category_id") or discord.utils.get(g.categories, name="YT Clipper")
         if not cat:
             cat = await g.create_category("YT Clipper", overwrites=ow)
-            self.db.set_cfg("category_id", str(cat.id))
+        self.db.set_cfg("category_id", str(cat.id))
         for key, name in (("autoedit_id", "autoedit"), ("vod_id", "video-clips"), ("alerts_id", "live-alerts")):
-            if not self.chan(key):
+            ch = self.chan(key) or discord.utils.get(cat.text_channels, name=name)
+            if not ch:
                 ch = await g.create_text_channel(name, category=cat, overwrites=ow)
-                self.db.set_cfg(key, str(ch.id))
+            self.db.set_cfg(key, str(ch.id))
 
     # --- posting clips ---
     async def post_clip(self, slug, path: Path, reason: str):
