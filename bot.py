@@ -190,7 +190,7 @@ class ClipBot(discord.Client):
         cid = int(self.db.get_cfg(key) or 0)
         return self.get_channel(cid) if cid else None
 
-        async def ensure_channels(self, g: discord.Guild):
+    async def ensure_channels(self, g: discord.Guild):
         """Reuses the YT Clipper channels that already exist, so a restart doesn't make new ones."""
         ow = self.channel_overwrites(g)
         cat = self.chan("category_id") or discord.utils.get(g.categories, name="YT Clipper")
@@ -204,14 +204,14 @@ class ClipBot(discord.Client):
             self.db.set_cfg(key, str(ch.id))
 
     # --- posting clips ---
-    async def post_clip(self, slug, path: Path, reason: str):
-        if slug == "vod":
+    async def post_clip(self, slug, path: Path, reason: str, ch=None):
+        if ch is None and slug == "vod":
             ch = self.chan("vod_id")
-        else:
+        elif ch is None:
             s = self.db.get_streamer(slug)
             ch = self.get_channel(s["channel_id"]) if s else None
         if not ch:
-            return
+            raise RuntimeError("The channel for clips is missing.")
         msg = await ch.send(content=f"🎬 **{slug}** — {reason}", file=discord.File(path))
         await msg.edit(view=ClipView(msg.attachments[0].url))
         self.db.add_clip(path.stem, slug, str(path), msg.id)
@@ -331,8 +331,12 @@ async def clipvideo(i: discord.Interaction, url: str, start: str, end: str):
     except Exception as ex:
         log.exception("clipvideo")
         return await i.followup.send(f"❌ {str(ex)[:300]}", ephemeral=True)
-    await bot.post_clip("vod", path, f"clip ({vod.fmt_ts(s)}–{vod.fmt_ts(e)})")
-    await i.followup.send("✅ Posted in #video-clips.", ephemeral=True)
+    try:
+        await bot.post_clip("vod", path, f"clip ({vod.fmt_ts(s)}–{vod.fmt_ts(e)})", i.channel)
+    except Exception as ex:
+        log.exception("post failed")
+        return await i.followup.send(f"❌ Couldn't post the clip: {str(ex)[:300]}", ephemeral=True)
+    await i.followup.send("✅ Posted here.", ephemeral=True)
 
 
 @bot.tree.command(description="Auto-find the best moments in a YouTube video and clip them")
@@ -350,16 +354,21 @@ async def autoclip(i: discord.Interaction, url: str, count: app_commands.Range[i
         log.exception("autoclip")
         return await i.followup.send(f"❌ {str(ex)[:300]}", ephemeral=True)
     await i.followup.send(f"🔍 Found {len(moments)} moments using **{method}**. Cutting…", ephemeral=True)
-    done = 0
+    done, last_err = 0, ""
     for s, e, why in moments:
         try:
             async with bot.edit_sem:
                 path = await vod.cut(url, s, e)
-            await bot.post_clip("vod", path, f"{why} @ {vod.fmt_ts(s)}")
+            await bot.post_clip("vod", path, f"{why} @ {vod.fmt_ts(s)}", i.channel)
             done += 1
-        except Exception:
+        except Exception as ex:
+            last_err = str(ex)[:200]
             log.exception("cut failed")
-    await i.followup.send(f"✅ Posted {done}/{len(moments)} clips in #video-clips.", ephemeral=True)
+    msg = f"✅ Posted {done}/{len(moments)} clips here."
+    if done < len(moments) and last_err:
+        msg += f"\n⚠️ Last error: {last_err}"
+    await i.followup.send(msg, ephemeral=True)
+
 
 @bot.tree.command(description="Give the bot your YouTube cookies so YouTube stops blocking it")
 @app_commands.describe(file="Your cookies.txt file exported from youtube.com")
@@ -378,5 +387,7 @@ async def ytcookies(i: discord.Interaction, file: discord.Attachment):
     note = "" if yt else "\n⚠️ None of them are for youtube.com, so this probably won't help."
     await i.followup.send(f"✅ Saved {n} cookies ({yt} for YouTube). Try /autoclip again.{note}\n"
                           "If Railway redeploys the bot, send the file again.", ephemeral=True)
+
+
 if __name__ == "__main__":
     bot.run(TOKEN)
