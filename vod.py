@@ -13,6 +13,44 @@ _run = clipper._run
 _HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
 
 
+COOKIE_FILE = Path(os.getenv("DB_PATH", "data.db")).resolve().parent / "yt_cookies.txt"
+
+
+def clean_cookies(text: str) -> str:
+    """Turns pasted cookies into the exact format yt-dlp needs.
+    Phones often turn the tabs into spaces, which makes yt-dlp ignore the file."""
+    text = text.replace("\\n", "\n").replace("\r", "")
+    lines = ["# Netscape HTTP Cookie File"]
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+            continue
+        parts = line.split("\t") if line.count("\t") >= 6 else line.split(None, 6)
+        if len(parts) == 6:          # cookie with an empty value
+            parts.append("")
+        if len(parts) == 7:
+            lines.append("\t".join(p.strip() for p in parts))
+    return "\n".join(lines) + "\n"
+
+
+def save_cookies(text: str) -> int:
+    """Saves cookies sent with /ytcookies. Returns how many cookies were found."""
+    cleaned = clean_cookies(text)
+    count = len(cleaned.splitlines()) - 1
+    if count:
+        COOKIE_FILE.write_text(cleaned)
+    return count
+
+
+def cookie_args():
+    """Uses cookies from /ytcookies, or from a YT_COOKIES variable on Railway, as a YouTube login."""
+    if not COOKIE_FILE.exists():
+        c = os.getenv("YT_COOKIES", "").strip()
+        if not c or not save_cookies(c):
+            return []
+    return ["--cookies", str(COOKIE_FILE)]
+
+
 def check_url(url: str):
     u = urlparse(url.strip())
     if u.scheme not in ("http", "https") or u.hostname not in _HOSTS:
@@ -52,7 +90,7 @@ def fmt_ts(t: float) -> str:
 
 
 async def info(url: str) -> dict:
-    rc, out, err = await _run("yt-dlp", "--dump-single-json", "--no-warnings", "--no-playlist", "--", url)
+    rc, out, err = await _run("yt-dlp", *cookie_args(), "--dump-single-json", "--no-warnings", "--no-playlist", "--", url)
     if rc:
         raise RuntimeError("Couldn't read that video: " + err.strip()[-200:])
     return json.loads(out)
@@ -78,7 +116,7 @@ async def cut(url: str, start: float, end: float, limit_mb: float = 9.0) -> Path
     out = CLIP_DIR / f"yt_{video_id(url) or 'video'}_{int(start)}_{cid}.mp4"
     raw = CLIP_DIR / f"raw_{cid}"
     rc, _, err = await _run(
-        "yt-dlp", "--no-playlist", "--no-warnings",
+        "yt-dlp", *cookie_args(), "--no-playlist", "--no-warnings",
         "-f", "bv*[height<=720]+ba/b[height<=720]/b",
         "--download-sections", f"*{start:.0f}-{end:.0f}", "--force-keyframes-at-cuts",
         "--merge-output-format", "mp4", "-o", f"{raw}.%(ext)s", "--", url)
@@ -155,7 +193,7 @@ async def find_moments(url: str, count: int):
         method, why = "Most Replayed", "most replayed"
     else:
         cid = uuid.uuid4().hex[:8]
-        rc, _, err = await _run("yt-dlp", "--no-playlist", "--no-warnings", "-f", "bestaudio",
+        rc, _, err = await _run("yt-dlp", *cookie_args(), "--no-playlist", "--no-warnings", "-f", "bestaudio",
                                 "-o", str(CLIP_DIR / f"aud_{cid}.%(ext)s"), "--", url)
         files = list(CLIP_DIR.glob(f"aud_{cid}.*"))
         try:
