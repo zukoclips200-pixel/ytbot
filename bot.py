@@ -7,7 +7,7 @@ from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
-import clipper, editor, vod
+import editor, smart, vod
 from db import DB
 
 load_dotenv()
@@ -157,13 +157,10 @@ class ClipBot(discord.Client):
         super().__init__(intents=discord.Intents.default())
         self.tree = OwnerTree(self)
         self.db = DB()
-        self.recorders: dict[str, clipper.Recorder] = {}
-        self.notified: set[str] = set()
         self.edit_sem = asyncio.Semaphore(2)
 
     async def setup_hook(self):
         self.add_view(ClipView())
-        self.watch_streams.start()
         self.maintenance.start()
 
     async def on_ready(self):
@@ -197,48 +194,20 @@ class ClipBot(discord.Client):
         if not cat:
             cat = await g.create_category("YT Clipper", overwrites=ow)
         self.db.set_cfg("category_id", str(cat.id))
-        for key, name in (("autoedit_id", "autoedit"), ("vod_id", "video-clips"), ("alerts_id", "live-alerts")):
+        for key, name in (("autoedit_id", "autoedit"), ("vod_id", "video-clips")):
             ch = self.chan(key) or discord.utils.get(cat.text_channels, name=name)
             if not ch:
                 ch = await g.create_text_channel(name, category=cat, overwrites=ow)
             self.db.set_cfg(key, str(ch.id))
 
     # --- posting clips ---
-    async def post_clip(self, slug, path: Path, reason: str, ch=None):
-        if ch is None and slug == "vod":
-            ch = self.chan("vod_id")
-        elif ch is None:
-            s = self.db.get_streamer(slug)
-            ch = self.get_channel(s["channel_id"]) if s else None
+    async def post_clip(self, slug, path: Path, reason: str, ch=None, content=None):
+        ch = ch or self.chan("vod_id")
         if not ch:
             raise RuntimeError("The channel for clips is missing.")
-        msg = await ch.send(content=f"🎬 **{slug}** — {reason}", file=discord.File(path))
+        msg = await ch.send(content=content or f"🎬 **{slug}** — {reason}", file=discord.File(path))
         await msg.edit(view=ClipView(msg.attachments[0].url))
         self.db.add_clip(path.stem, slug, str(path), msg.id)
-
-    # --- live detection ---
-    @tasks.loop(seconds=45)
-    async def watch_streams(self):
-        for s in self.db.list_streamers():
-            slug = s["slug"]
-            rec = self.recorders.get(slug)
-            if rec and not rec.done():
-                continue
-            url = await clipper.get_stream_url(slug)
-            if not url:
-                self.notified.discard(slug)
-                continue
-            rec = clipper.Recorder(slug, url, self.post_clip)
-            self.recorders[slug] = rec
-            rec.start()
-            if slug not in self.notified:
-                self.notified.add(slug)
-                if ch := self.chan("alerts_id"):
-                    await ch.send(f"🔴 **{slug}** is live on YouTube! {clipper.channel_url(slug)}")
-
-    @watch_streams.before_loop
-    async def _w1(self):
-        await self.wait_until_ready()
 
     # --- cleanup of old files ---
     @tasks.loop(minutes=30)
@@ -260,58 +229,6 @@ bot = ClipBot()
 
 
 # ───────────────────────── commands ─────────────────────────
-@bot.tree.command(description="Watch a YouTube channel and auto-clip when it goes live")
-@app_commands.describe(slug="YouTube @handle, e.g. mrbeast (not the channel ID)")
-@app_commands.guild_only()
-async def addstreamer(i: discord.Interaction, slug: str):
-    slug = slug.lower().strip().lstrip("@")
-    if bot.db.get_streamer(slug):
-        return await i.response.send_message("Already added.", ephemeral=True)
-    await i.response.defer(ephemeral=True)
-    ch = await i.guild.create_text_channel(f"{slug}-clips", category=bot.chan("category_id"),
-                                           overwrites=bot.channel_overwrites(i.guild))
-    bot.db.add_streamer(slug, "yt", ch.id, 0)
-    await i.followup.send(f"✅ Watching **{slug}** → {ch.mention}", ephemeral=True)
-
-
-@bot.tree.command(description="Stop watching a YouTube channel")
-@app_commands.guild_only()
-async def removestreamer(i: discord.Interaction, slug: str):
-    slug = slug.lower().strip().lstrip("@")
-    s = bot.db.get_streamer(slug)
-    if not s:
-        return await i.response.send_message("Not found.", ephemeral=True)
-    if rec := bot.recorders.pop(slug, None):
-        await rec.stop()
-    if ch := i.guild.get_channel(s["channel_id"]):
-        await ch.delete()
-    bot.db.remove_streamer(slug)
-    await i.response.send_message(f"Removed **{slug}**.", ephemeral=True)
-
-
-@bot.tree.command(description="List the YouTube channels being watched")
-@app_commands.guild_only()
-async def streamers(i: discord.Interaction):
-    rows = bot.db.list_streamers()
-    text = "\n".join(f"• {r['slug']}" for r in rows) or "None yet. Use /addstreamer."
-    await i.response.send_message(text, ephemeral=True)
-
-
-@bot.tree.command(description="Clip the last 15 seconds of a live stream right now")
-@app_commands.guild_only()
-async def clip(i: discord.Interaction, streamer: str):
-    slug = streamer.lower().strip().lstrip("@")
-    rec = bot.recorders.get(slug)
-    if not rec or rec.done():
-        return await i.response.send_message("They're not live right now.", ephemeral=True)
-    await i.response.defer(ephemeral=True)
-    path = await rec.make_clip()
-    if not path:
-        return await i.followup.send("Not enough recorded yet, try again in a few seconds.", ephemeral=True)
-    await bot.post_clip(slug, path, "manual clip")
-    await i.followup.send("✅ Clipped!", ephemeral=True)
-
-
 @bot.tree.command(description="Cut a specific moment from a YouTube video")
 @app_commands.describe(url="YouTube video link", start="e.g. 1:23:45 or 5025",
                        end="e.g. 1:24:15 (clip can be 3-90 seconds)")
@@ -339,7 +256,7 @@ async def clipvideo(i: discord.Interaction, url: str, start: str, end: str):
     await i.followup.send("✅ Posted here.", ephemeral=True)
 
 
-@bot.tree.command(description="Auto-find the best moments in a YouTube video and clip them")
+@bot.tree.command(description="AI finds the best complete moments in a YouTube video and clips them")
 @app_commands.describe(url="YouTube video link (not a live stream)", count="How many clips (1-8)")
 @app_commands.guild_only()
 async def autoclip(i: discord.Interaction, url: str, count: app_commands.Range[int, 1, 8] = 5):
@@ -347,27 +264,38 @@ async def autoclip(i: discord.Interaction, url: str, count: app_commands.Range[i
         vod.check_url(url)
     except ValueError as ex:
         return await i.response.send_message(f"❌ {ex}", ephemeral=True)
-    await i.response.defer(ephemeral=True)
+    await i.response.send_message("⏳ Started. I'll post progress in this channel.", ephemeral=True)
+    note = await i.channel.send(f"⏳ Working on <{url}> for {i.user.mention}…")
+
+    async def status(text):
+        try:
+            await note.edit(content=f"{text}\n<{url}>")
+        except discord.HTTPException:
+            pass
+
     try:
-        moments, method = await vod.find_moments(url, count)
+        vtype, source, clips = await smart.find_clips(url, count, status)
     except Exception as ex:
         log.exception("autoclip")
-        return await i.followup.send(f"❌ {str(ex)[:300]}", ephemeral=True)
-    await i.followup.send(f"🔍 Found {len(moments)} moments using **{method}**. Cutting…", ephemeral=True)
+        return await status(f"❌ {str(ex)[:400]}")
+
     done, last_err = 0, ""
-    for s, e, why in moments:
+    for n, c in enumerate(clips, 1):
+        await status(f"🎬 Cutting clip {n}/{len(clips)}…")
         try:
             async with bot.edit_sem:
-                path = await vod.cut(url, s, e)
-            await bot.post_clip("vod", path, f"{why} @ {vod.fmt_ts(s)}", i.channel)
+                path = await vod.cut(url, c["start"], c["end"])
+            text = (f"🎬 **{c['title']}**\n{c['caption']}\n"
+                    f"-# {vtype} • {vod.fmt_ts(c['start'])}–{vod.fmt_ts(c['end'])} • score {c['score']:.0f}/10")
+            await bot.post_clip("vod", path, "", i.channel, content=text[:1900])
             done += 1
         except Exception as ex:
             last_err = str(ex)[:200]
             log.exception("cut failed")
-    msg = f"✅ Posted {done}/{len(moments)} clips here."
-    if done < len(moments) and last_err:
+    msg = f"✅ Posted {done}/{len(clips)} clips. Video type: **{vtype}** (transcript from {source})."
+    if done < len(clips) and last_err:
         msg += f"\n⚠️ Last error: {last_err}"
-    await i.followup.send(msg, ephemeral=True)
+    await status(msg)
 
 
 @bot.tree.command(description="Give the bot your YouTube cookies so YouTube stops blocking it")
@@ -385,8 +313,7 @@ async def ytcookies(i: discord.Interaction, file: discord.Attachment):
                                      ephemeral=True)
     yt = sum(1 for line in text.splitlines() if "youtube.com" in line)
     note = "" if yt else "\n⚠️ None of them are for youtube.com, so this probably won't help."
-    await i.followup.send(f"✅ Saved {n} cookies ({yt} for YouTube). Try /autoclip again.{note}\n"
-                          "If Railway redeploys the bot, send the file again.", ephemeral=True)
+    await i.followup.send(f"✅ Saved {n} cookies ({yt} for YouTube). Try /autoclip again.{note}", ephemeral=True)
 
 
 if __name__ == "__main__":
