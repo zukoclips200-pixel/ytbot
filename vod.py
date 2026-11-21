@@ -99,11 +99,12 @@ async def info(url: str) -> dict:
 async def shrink(src: Path, dst: Path, limit_mb: float):
     dur = await editor.duration(src)
     vb = int(min(5000, max(500, limit_mb * 8000 * 0.92 / max(dur, 1) - 128)))
-    rc, _, err = await _run(
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
-        "-vf", "scale='min(1280,iw)':-2", "-c:v", "libx264", "-preset", "veryfast",
-        "-b:v", f"{vb}k", "-maxrate", f"{int(vb * 1.3)}k", "-bufsize", f"{vb * 2}k",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst))
+    async with editor.ENCODE_LOCK:
+        rc, _, err = await _run(
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
+            "-vf", "scale='min(1280,iw)':-2", "-c:v", "libx264", "-preset", "veryfast", "-threads", "2",
+            "-b:v", f"{vb}k", "-maxrate", f"{int(vb * 1.3)}k", "-bufsize", f"{vb * 2}k",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst))
     if rc:
         raise RuntimeError("Encode failed: " + err[-200:])
 
