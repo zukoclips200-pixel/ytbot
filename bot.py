@@ -359,6 +359,22 @@ async def autoclip(i: discord.Interaction, url: str, count: app_commands.Range[i
             log.exception("cut failed")
     await i.followup.send(f"✅ Posted {done}/{len(moments)} clips in #video-clips.", ephemeral=True)
 
-
+@bot.tree.command(description="Give the bot your YouTube cookies so YouTube stops blocking it")
+@app_commands.describe(file="Your cookies.txt file exported from youtube.com")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def ytcookies(i: discord.Interaction, file: discord.Attachment):
+    if file.size > 1_000_000:
+        return await i.response.send_message("❌ That file is too big to be a cookies file.", ephemeral=True)
+    await i.response.defer(ephemeral=True)
+    text = (await file.read()).decode("utf-8", errors="ignore")
+    n = vod.save_cookies(text)
+    if not n:
+        return await i.followup.send("❌ I couldn't find any cookies in that file. Export it again as cookies.txt.",
+                                     ephemeral=True)
+    yt = sum(1 for line in text.splitlines() if "youtube.com" in line)
+    note = "" if yt else "\n⚠️ None of them are for youtube.com, so this probably won't help."
+    await i.followup.send(f"✅ Saved {n} cookies ({yt} for YouTube). Try /autoclip again.{note}\n"
+                          "If Railway redeploys the bot, send the file again.", ephemeral=True)
 if __name__ == "__main__":
     bot.run(TOKEN)
