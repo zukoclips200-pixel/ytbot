@@ -6,13 +6,15 @@ from pathlib import Path
 PIPE = asyncio.subprocess.PIPE
 OUT_DIR = Path("edits")
 OUT_DIR.mkdir(exist_ok=True)
+ENCODE_LOCK = asyncio.Semaphore(1)   # one video encode at a time, so the small server doesn't run out of memory
 
 # key: (label, width, height)
+# 720p: looks sharper than 1080p under Discord's 10 MB limit and uses far less memory.
 SIZES = {
-    "9x16_full": ("9:16 full zoom", 1080, 1920),
-    "9x16_fit": ("9:16 fit (shows whole clip)", 1080, 1920),
-    "1x1": ("1:1 square", 1080, 1080),
-    "16x9": ("Original 16:9", 1920, 1080),
+    "9x16_full": ("9:16 full zoom", 720, 1280),
+    "9x16_fit": ("9:16 fit (shows whole clip)", 720, 1280),
+    "1x1": ("1:1 square", 720, 720),
+    "16x9": ("Original 16:9", 1280, 720),
 }
 # key: (label, brightness, contrast, saturation)
 COLORS = {
@@ -143,14 +145,17 @@ async def autoedit(src: Path, dst: Path, o: EditOpts, overlay_path: Path | None 
     vb = int(min(6000, max(500, limit_mb * 8000 * 0.92 / max(out_len, 1) - 128)))
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *inputs,
            "-filter_complex", ";".join(fc), "-map", "[vout]", "-map", amap,
-           "-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{vb}k",
+           "-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-b:v", f"{vb}k",
            "-maxrate", f"{int(vb * 1.3)}k", "-bufsize", f"{vb * 2}k", "-pix_fmt", "yuv420p",
            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst)]
     try:
-        rc, _, err = await _run(*cmd)
+        async with ENCODE_LOCK:
+            rc, _, err = await _run(*cmd)
     finally:
         if title_file:
             title_file.unlink(missing_ok=True)
     if rc:
-        raise RuntimeError(err[-500:] or "ffmpeg failed")
+        if rc < 0 or not err.strip():
+            raise RuntimeError("the server ran out of memory. Wait for other clips to finish, then try again.")
+        raise RuntimeError(err[-500:])
     return dst
