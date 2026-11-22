@@ -106,14 +106,24 @@ def _whisper_file(path: Path):
 
 
 async def download_audio(url, cid, s0=0.0, e0=None):
-    """Downloads the sound of the video, or only the part between s0 and e0 (seconds)."""
-    sec = ["--download-sections", f"*{int(s0)}-{int(e0) + 1}"] if e0 else []
-    rc, _, err = await _run("yt-dlp", *vod.cookie_args(), "--no-playlist", "--no-warnings", *sec,
-                            "-f", "bestaudio/best", "-o", str(CLIP_DIR / f"aud_{cid}.%(ext)s"), "--", url)
-    src = [f for f in CLIP_DIR.glob(f"aud_{cid}.*") if "_part" not in f.name]
-    if rc or not src:
+    """Downloads the sound of the video, then keeps only the part between s0 and e0 (seconds).
+    Asking YouTube for just a slice of a long stream is very slow, so the bot downloads the whole
+    sound track at full speed (small, low-bitrate audio) and cuts the part out itself."""
+    rc, _, err = await _run("yt-dlp", *vod.cookie_args(), "--no-playlist", "--no-warnings", "-N", "4",
+                            "-f", "ba[abr<=80]/ba/b", "-o", str(CLIP_DIR / f"aud_{cid}_full.%(ext)s"), "--", url)
+    full = [f for f in CLIP_DIR.glob(f"aud_{cid}_full.*") if not f.name.endswith((".part", ".ytdl"))]
+    if rc or not full:
         raise SmartError("Audio download failed: " + err.strip()[-200:])
-    return src[0]
+    if not s0 and e0 is None:
+        return full[0]
+    out = CLIP_DIR / f"aud_{cid}.mp3"
+    span = ["-t", f"{e0 - s0 + 1:.1f}"] if e0 else []
+    rc, _, err = await _run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{s0:.1f}", *span,
+                            "-i", str(full[0]), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", str(out))
+    full[0].unlink(missing_ok=True)
+    if rc or not out.exists():
+        raise SmartError("Couldn't cut the audio: " + err[-200:])
+    return out
 
 
 async def whisper_transcript(url, s0=0.0, e0=None):
@@ -182,7 +192,7 @@ async def sound_scan(url, s0, e0, n, status, ranged=True):
     listen closely only to those moments. Uses far less of the free Groq allowance."""
     cid = uuid.uuid4().hex[:8]
     try:
-        await status("🔊 Scanning the sound for hype moments (free, no AI)…")
+        await status("🔊 Downloading the sound and scanning it for hype moments (free, no AI)…")
         audio = await download_audio(url, cid, s0, e0 if ranged else None)
         scored = vod.surge_scores(await vod.loudness_series(audio))
         peaks = sorted(t for t, _ in vod.pick_peaks(scored, n, min_gap=SCAN_WIN, skip_start=10))
