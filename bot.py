@@ -65,6 +65,9 @@ class EditView(discord.ui.View):
         self.cap_btn.label = {"auto": "Captions: auto", "on": "Captions: on", "off": "Captions: off"}[self.o.captions]
         self.cap_btn.style = (discord.ButtonStyle.secondary if self.o.captions == "off"
                               else discord.ButtonStyle.success)
+        self.game_btn.label = f"🎮 Gaming layout: {self.o.gaming}"
+        self.game_btn.style = (discord.ButtonStyle.success if self.o.gaming == "auto"
+                               else discord.ButtonStyle.secondary)
 
     @discord.ui.select(row=0, placeholder="Size",
                        options=[discord.SelectOption(label=v[0], value=k) for k, v in editor.SIZES.items()])
@@ -115,6 +118,12 @@ class EditView(discord.ui.View):
         self.sync()
         await interaction.response.edit_message(view=self)
 
+    @discord.ui.button(row=3, label="🎮 Gaming layout: auto")
+    async def game_btn(self, interaction, button):
+        self.o.gaming = "off" if self.o.gaming == "auto" else "auto"
+        self.sync()
+        await interaction.response.edit_message(view=self)
+
     @discord.ui.button(row=3, label="Start edit", style=discord.ButtonStyle.success, emoji="✅")
     async def start_btn(self, interaction, button):
         await interaction.response.edit_message(content="⏳ Editing your clip…", view=None)
@@ -159,7 +168,9 @@ class ClipView(discord.ui.View):
         row = client.db.clip_by_message(interaction.message.id)
         clip = dict(row) if row else {"path": "", "slug": "vod"}
         await interaction.response.send_message(
-            "**Auto-edit options**\n✨ *Smart 9:16* picks split screen, face tracking or a gaming layout by itself.",
+            "**Auto-edit options**\n✨ *Smart 9:16* picks split screen, face tracking or a gaming layout by itself.\n"
+            "🎮 *Gaming layout: auto* puts the streamer on top and the gameplay below when it finds a webcam. "
+            "Tap it to switch it off.",
             view=EditView(clip, interaction.user.id, interaction.message), ephemeral=True)
 
 
@@ -277,24 +288,34 @@ async def clipvideo(i: discord.Interaction, url: str, start: str, end: str):
 
 
 @bot.tree.command(description="AI finds the best complete moments in a YouTube video and clips them")
-@app_commands.describe(url="YouTube video link (not a live stream)", count="How many clips (1-8)")
+@app_commands.describe(url="YouTube video link (not a live stream)", count="How many clips (1-8)",
+                       start="Optional: only look from here, e.g. 0:00 or 4:00:00 (for long streams)",
+                       end="Optional: only look up to here, e.g. 4:00:00 (up to 4 hours after start)")
 @app_commands.guild_only()
-async def autoclip(i: discord.Interaction, url: str, count: app_commands.Range[int, 1, 8] = 5):
+async def autoclip(i: discord.Interaction, url: str, count: app_commands.Range[int, 1, 8] = 5,
+                   start: str = "", end: str = ""):
     try:
         vod.check_url(url)
+        s0 = vod.parse_ts(start) if start.strip() else None
+        e0 = vod.parse_ts(end) if end.strip() else None
     except ValueError as ex:
         return await i.response.send_message(f"❌ {ex}", ephemeral=True)
+    if s0 is not None and e0 is not None and e0 <= s0:
+        return await i.response.send_message("❌ End must be after start.", ephemeral=True)
+    part = ""
+    if s0 is not None or e0 is not None:
+        part = f" (from {vod.fmt_ts(s0 or 0)} to {vod.fmt_ts(e0) if e0 else 'the end'})"
     await i.response.send_message("⏳ Started. I'll post progress in this channel.", ephemeral=True)
-    note = await i.channel.send(f"⏳ Working on <{url}> for {i.user.mention}…")
+    note = await i.channel.send(f"⏳ Working on <{url}>{part} for {i.user.mention}…")
 
     async def status(text):
         try:
-            await note.edit(content=f"{text}\n<{url}>")
+            await note.edit(content=f"{text}\n<{url}>{part}")
         except discord.HTTPException:
             pass
 
     try:
-        vtype, source, clips = await smart.find_clips(url, count, status)
+        vtype, source, clips = await smart.find_clips(url, count, status, s0, e0)
     except Exception as ex:
         log.exception("autoclip")
         return await status(f"❌ {str(ex)[:400]}")
