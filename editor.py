@@ -46,6 +46,7 @@ class EditOpts:
     title: str = ""
     captions: str = "auto"  # auto = skip if the video already has captions burned in
     vtype: str = ""         # podcast / gaming / ... from the AI, helps pick the layout
+    gaming: str = "auto"    # auto = streamer on top + gameplay below when a webcam is found; off = never
 
 
 async def _run(*args):
@@ -131,7 +132,7 @@ async def autoedit(src: Path, dst: Path, o: EditOpts, overlay_path: Path | None 
     info = {"burned_captions": False}
     if o.size == "smart":
         async with ENCODE_LOCK:
-            info = await asyncio.to_thread(layout.analyze, src, o.vtype, o.flip)
+            info = await asyncio.to_thread(layout.analyze, src, o.vtype, o.flip, o.gaming != "off")
         f, place = layout.filter_for(info, cur, remap)
         fc.append(f)
         notes.append(f"layout: {info.get('layout')}")
