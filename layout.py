@@ -45,22 +45,17 @@ class _Faces:
         return [tuple(map(float, f)) for f in found]
 
 
-def _text_mask(gray):
-    """Bright, sharp-edged pixels in the lower part of the frame (where burned-in captions sit)."""
-    h, w = gray.shape
-    band = gray[int(h * 0.55):int(h * 0.95)]
-    return (cv2.Canny(band, 120, 240) > 0) & (band > 200)
-
-
-def _has_text(mask):
-    rows = mask.mean(axis=1)
-    return (rows > 0.02).sum() >= max(8, int(mask.shape[0] * 0.06))
-
-
-def _changed(mask, prev):
-    both = (mask & prev).sum()
-    either = (mask | prev).sum() or 1
-    return both / either < 0.6
+def _caption_text(small):
+    """True if the lower part of the frame has caption-style text: bright (white or coloured) letters
+    with a dark outline. Faces, shirts and backgrounds don't have that pattern."""
+    h = small.shape[0]
+    band = small[int(h * 0.55):int(h * 0.97)]
+    v = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)[..., 2]
+    bright = (v > 185).astype(np.uint8)
+    dark = (v < 60).astype(np.uint8)
+    outline = cv2.dilate(dark, np.ones((3, 3), np.uint8), iterations=2) & bright
+    rows = outline.mean(axis=1)
+    return (rows > 0.03).sum() >= max(8, int(band.shape[0] * 0.06))
 
 
 def sample(path):
@@ -71,7 +66,7 @@ def sample(path):
     step = max(1, int(round(fps / SAMPLE_FPS)))
     det = _Faces()
     scale = 640 / W if W > 640 else 1.0
-    out, present, changes, i, prev = [], 0, 0, 0, None
+    out, present, i = [], 0, 0
     while len(out) < MAX_SAMPLES:
         if not cap.grab():
             break
@@ -83,18 +78,12 @@ def sample(path):
             faces = [(x / scale, y / scale, w / scale, h / scale) for x, y, w, h in det(small)]
             faces = [f for f in faces if f[2] >= W * 0.035]
             out.append((i / fps, faces))
-            mask = _text_mask(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
-            if _has_text(mask):
+            if _caption_text(cv2.resize(small, (640, max(2, int(640 * H / W))))):
                 present += 1
-                if prev is not None and _has_text(prev) and _changed(mask, prev):
-                    changes += 1
-            prev = mask
         i += 1
     cap.release()
     n = len(out) or 1
-    # Captions = bright sharp text in the lower part on most frames, and it keeps changing
-    # (a white shirt or a logo is there too, but it doesn't change).
-    burned = present / n >= 0.4 and changes / n >= 0.08
+    burned = present / n >= 0.3     # captions are on screen for a good part of the clip
     return W, H, out, burned
 
 
@@ -157,6 +146,11 @@ def analyze(path, vtype="", flip=False):
     if not samples or W < H:
         info["layout"] = "fit" if W >= H else "vertical"
         return info
+    if burned:
+        # The video already has captions at the bottom: show the whole frame so they aren't cut off
+        # and the bot doesn't add a second set.
+        info["layout"] = "fit"
+        return info
     cl = [c for c in _clusters(samples, W) if c["share"] >= 0.25]
 
     def mirror(c):
@@ -172,9 +166,10 @@ def analyze(path, vtype="", flip=False):
     if len(big) >= 2:
         a, b = big[0], big[1]
         both = len(a["times"] & b["times"]) / max(1, min(len(a["times"]), len(b["times"])))
-        if both >= 0.5 and abs(a["cx"] - b["cx"]) > W * 0.25:
+        gap = abs(a["cx"] - b["cx"])
+        if both >= 0.5 and gap > W * 0.15:
             left, right = sorted((mirror(a), mirror(b)), key=lambda c: c["cx"])
-            info.update(layout="split", top=left, bottom=right)
+            info.update(layout="split", top=left, bottom=right, gap=gap)
             return info
     if big:
         cw, x0, moves = _track_moves(samples, W, H, flip)
@@ -189,9 +184,12 @@ def _even(v):
     return int(v) // 2 * 2
 
 
-def _person_crop(c, W, H, aspect, face_at=0.42):
-    """A crop around one face; face_at = how far down the crop the face sits (0.5 = middle)."""
+def _person_crop(c, W, H, aspect, face_at=0.42, max_w=None):
+    """A crop around one face; face_at = how far down the crop the face sits (0.5 = middle).
+    max_w keeps the crop narrow when two people sit close, so each half shows one person."""
     ch = min(H, max(c["h"] * 2.8, H * 0.5))
+    if max_w:
+        ch = min(ch, max(max_w / aspect, c["h"] * 1.8))
     cw = ch * aspect
     if cw > W:
         cw, ch = W, W / aspect
@@ -205,8 +203,9 @@ def filter_for(info, src, remap=lambda t: t):
     lay = info.get("layout", "fit")
     W, H = info.get("W", 1280), info.get("H", 720)
     if lay == "split":
-        a = _person_crop(info["top"], W, H, OUT_W / (OUT_H / 2), 0.55)   # lower, so the title fits above
-        b = _person_crop(info["bottom"], W, H, OUT_W / (OUT_H / 2))
+        mw = info.get("gap", W) * 1.15
+        a = _person_crop(info["top"], W, H, OUT_W / (OUT_H / 2), 0.55, mw)   # lower, so the title fits above
+        b = _person_crop(info["bottom"], W, H, OUT_W / (OUT_H / 2), 0.42, mw)
         f = (f"[{src}]split[p1][p2];"
              f"[p1]crop={a[0]}:{a[1]}:{a[2]}:{a[3]},scale={OUT_W}:{OUT_H // 2},setsar=1[t1];"
              f"[p2]crop={b[0]}:{b[1]}:{b[2]}:{b[3]},scale={OUT_W}:{OUT_H // 2},setsar=1[t2];"
