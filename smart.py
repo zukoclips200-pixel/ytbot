@@ -247,14 +247,40 @@ def _windows(lines):
     return out
 
 
-def pick(meta, vtype, segs, ads, want):
+def hot_ranges(meta, dur):
+    """Parts of the video people re-watch most (YouTube's 'Most replayed'), widened a bit.
+    Only these parts are sent to the AI, which makes long videos much faster."""
+    heat = meta.get("heatmap") or []
+    if dur < 20 * 60 or len(heat) < 20:
+        return None
+    vals = sorted(h["value"] for h in heat)
+    cut = vals[int(len(vals) * 0.55)]
+    if cut >= vals[-1]:
+        return None
+    ranges = []
+    for h in heat:
+        if h["value"] > cut:
+            a, b = h["start_time"] - 60, h["end_time"] + 60
+            if ranges and a <= ranges[-1][1]:
+                ranges[-1][1] = max(ranges[-1][1], b)
+            else:
+                ranges.append([a, b])
+    return ranges
+
+
+def pick(meta, vtype, segs, ads, want, allowed=None):
     lo, hi = LENGTHS[vtype]
-    lines = []
+    lines, prev = [], -1
     for i, (s, e, t) in enumerate(segs):
+        if allowed is not None and i not in allowed:
+            continue
+        if prev >= 0 and i != prev + 1:
+            lines.append("--- (part of the video skipped, never join clips across this line) ---")
+        prev = i
         if any(_overlap(s, e, a0, a1) > 0.5 * (e - s) for a0, a1, _ in ads):
             lines.append(f"[{i}] (AD - never use)")
         else:
-            lines.append(f"[{i}] {vod.fmt_ts(s)} {t}")
+            lines.append(f"[{i}|{vod.fmt_ts(s)}] {t}")
     wins = _windows(lines)
     per = max(2, math.ceil(want * 1.6 / len(wins)))
     system = (
@@ -272,7 +298,7 @@ def pick(meta, vtype, segs, ads, want):
     found = []
     for w in wins:
         user = (f"Video title: {meta.get('title')}\nFind up to {per} clips in this part of the transcript. "
-                f"Each line is [id] time text.\n\n" + "\n".join(w))
+                f"Each line is [id|time] text.\n\n" + "\n".join(w))
         try:
             out = _chat(system, user)
         except SmartError:
@@ -289,14 +315,20 @@ def pick(meta, vtype, segs, ads, want):
     return found
 
 
-def clean(segs, cands, ads, vtype):
+def clean(segs, cands, ads, vtype, allowed=None):
     lo, hi = LENGTHS[vtype]
     keep = []
+    ok = (lambda i: True) if allowed is None else (lambda i: i in allowed)
     for a, b, sc, why in sorted(cands, key=lambda x: -x[2]):
+        if not all(ok(i) for i in range(a, b + 1)):
+            continue
         while b > a and segs[b][1] - segs[a][0] > hi + 5:   # too long: end on an earlier sentence
             b -= 1
+        while segs[b][1] - segs[a][0] < lo and b + 1 < len(segs) and ok(b + 1) \
+                and segs[b + 1][1] - segs[a][0] <= hi:      # too short: add the next sentence(s)
+            b += 1
         s, e = max(0.0, segs[a][0] - 0.25), segs[b][1] + 0.4
-        if e - s < max(8, lo - 10):
+        if e - s < lo - 3:
             continue
         text = " ".join(t for _, _, t in segs[a:b + 1])
         if AD_WORDS.search(text) or any(_overlap(s, e, a0, a1) > 2 for a0, a1, _ in ads):
@@ -346,8 +378,14 @@ async def find_clips(url, count, status):
     await status("🧠 Working out what kind of video this is…")
     vtype = await asyncio.to_thread(classify, meta, segs)
     await status(f"✂️ Finding the best **{vtype}** moments (skipping {len(ads)} ad/intro parts)…")
-    cands = await asyncio.to_thread(pick, meta, vtype, segs, ads, count)
-    clips = clean(segs, cands, ads, vtype)[:count]
+    hot = hot_ranges(meta, dur)
+    allowed = None
+    if hot:
+        allowed = {i for i, (s, e, _) in enumerate(segs) if any(a <= s <= b for a, b in hot)}
+        if len(allowed) < len(segs) * 0.25:
+            allowed = None
+    cands = await asyncio.to_thread(pick, meta, vtype, segs, ads, count, allowed)
+    clips = clean(segs, cands, ads, vtype, allowed)[:count]
     if not clips:
         raise SmartError("I couldn't find any moments strong enough to clip in this video.")
     clips.sort(key=lambda c: c["start"])
