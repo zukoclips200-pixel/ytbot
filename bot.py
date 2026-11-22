@@ -1,5 +1,5 @@
 """YouTube clipping bot: everyone in your server can use it."""
-import asyncio, logging, os, time
+import asyncio, logging, os, re, time
 from pathlib import Path
 
 import discord
@@ -41,10 +41,15 @@ class TitleModal(discord.ui.Modal, title="Clip title"):
 
 
 class EditView(discord.ui.View):
-    def __init__(self, clip, user_id):
+    def __init__(self, clip, user_id, message=None):
         super().__init__(timeout=300)
-        self.clip, self.user_id = clip, user_id
+        self.clip, self.user_id, self.message = clip, user_id, message
         self.o = editor.EditOpts()
+        m = re.search(r"-# (\w+) •", (message.content if message else "") or "")
+        self.o.vtype = m.group(1) if m else ""
+        t = re.search(r"🎬 \*\*(.+?)\*\*", (message.content if message else "") or "")
+        if t and self.clip.get("slug") == "vod":
+            self.o.title = t.group(1)[:60]
         self.sync()
 
     async def interaction_check(self, interaction):
@@ -57,6 +62,9 @@ class EditView(discord.ui.View):
                         (self.short_btn, self.o.shorten), (self.overlay_btn, self.o.overlay)):
             btn.style = discord.ButtonStyle.success if on else discord.ButtonStyle.secondary
         self.title_btn.label = f"Title: {self.o.title[:20]}" if self.o.title else "Add title"
+        self.cap_btn.label = {"auto": "Captions: auto", "on": "Captions: on", "off": "Captions: off"}[self.o.captions]
+        self.cap_btn.style = (discord.ButtonStyle.secondary if self.o.captions == "off"
+                              else discord.ButtonStyle.success)
 
     @discord.ui.select(row=0, placeholder="Size",
                        options=[discord.SelectOption(label=v[0], value=k) for k, v in editor.SIZES.items()])
@@ -100,23 +108,35 @@ class EditView(discord.ui.View):
     async def title_btn(self, interaction, button):
         await interaction.response.send_modal(TitleModal(self))
 
+    @discord.ui.button(row=3, label="Captions: auto")
+    async def cap_btn(self, interaction, button):
+        modes = editor.CAPTION_MODES
+        self.o.captions = modes[(modes.index(self.o.captions) + 1) % len(modes)]
+        self.sync()
+        await interaction.response.edit_message(view=self)
+
     @discord.ui.button(row=3, label="Start edit", style=discord.ButtonStyle.success, emoji="✅")
     async def start_btn(self, interaction, button):
         await interaction.response.edit_message(content="⏳ Editing your clip…", view=None)
         self.stop()
         client: ClipBot = interaction.client
-        src = Path(self.clip["path"])
+        src = Path(self.clip["path"] or "missing.mp4")
         if not src.exists():
-            return await interaction.edit_original_response(content="❌ Source clip expired.")
+            # The saved file is gone (e.g. after an update): grab the clip from the Discord message instead.
+            att = self.message.attachments[0] if self.message and self.message.attachments else None
+            if not att:
+                return await interaction.edit_original_response(content="❌ Source clip expired.")
+            src = editor.OUT_DIR / f"src_{self.message.id}.mp4"
+            await att.save(src)
         dst = editor.OUT_DIR / f"{src.stem}_edit_{int(time.time())}.mp4"
         try:
             async with client.edit_sem:
-                await editor.autoedit(src, dst, self.o, OVERLAY, FONT_PATH)
+                notes = await editor.autoedit(src, dst, self.o, OVERLAY, FONT_PATH)
         except Exception as e:
             log.exception("edit failed")
             return await interaction.edit_original_response(content=f"❌ Edit failed: {str(e)[:300]}")
         ch = client.chan("autoedit_id") or interaction.channel
-        msg = await ch.send(content=f"Edited **{self.clip['slug']}** clip", file=discord.File(dst))
+        msg = await ch.send(content=f"✂️ Edited clip" + (f" • {notes}" if notes else ""), file=discord.File(dst))
         v = discord.ui.View()
         v.add_item(discord.ui.Button(label="⬇️ Download", url=msg.attachments[0].url))
         await msg.edit(view=v)
@@ -136,11 +156,11 @@ class ClipView(discord.ui.View):
         if not owner_ok(interaction):
             return await interaction.response.send_message("Please use this inside a server.", ephemeral=True)
         client: ClipBot = interaction.client
-        clip = client.db.clip_by_message(interaction.message.id)
-        if not clip:
-            return await interaction.response.send_message("Clip not found (expired?).", ephemeral=True)
-        await interaction.response.send_message("**Auto-edit options**", view=EditView(clip, interaction.user.id),
-                                                ephemeral=True)
+        row = client.db.clip_by_message(interaction.message.id)
+        clip = dict(row) if row else {"path": "", "slug": "vod"}
+        await interaction.response.send_message(
+            "**Auto-edit options**\n✨ *Smart 9:16* picks split screen, face tracking or a gaming layout by itself.",
+            view=EditView(clip, interaction.user.id, interaction.message), ephemeral=True)
 
 
 # ───────────────────────── bot ─────────────────────────
