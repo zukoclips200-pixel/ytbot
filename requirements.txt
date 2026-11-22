@@ -2,3 +2,5 @@ discord.py>=2.4
 python-dotenv>=1.0
 requests>=2.31
 yt-dlp[default]>=2025.11.12
+opencv-python-headless>=4.8
+numpy>=1.26
