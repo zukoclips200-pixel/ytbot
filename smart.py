@@ -22,6 +22,9 @@ WHISPER = os.getenv("GROQ_WHISPER", "whisper-large-v3-turbo")
 WHISPER_MAX_MIN = int(os.getenv("WHISPER_MAX_MINUTES", 110))   # Groq free plan: ~2 hours of audio per hour
 CHUNK_SEC = 600                                                # audio is sent in 10-minute pieces
 WINDOW_CHARS = 9000                                            # transcript sent to the AI per request
+MAX_RANGE = 4 * 3600          # the most the bot handles in one go (use start/end for longer streams)
+MAX_VIDEO = 48 * 3600         # longest video it accepts at all (with start/end)
+SCAN_WIN = 90                 # sound scan: seconds listened to around each hype moment
 
 SB_CATS = ["sponsor", "selfpromo", "interaction", "intro", "outro", "preview", "music_offtopic"]
 AD_WORDS = re.compile(
@@ -102,14 +105,21 @@ def _whisper_file(path: Path):
     raise SmartError("Transcription kept hitting Groq's limit. Try again later.")
 
 
-async def whisper_transcript(url):
-    cid = uuid.uuid4().hex[:8]
-    rc, _, err = await _run("yt-dlp", *vod.cookie_args(), "--no-playlist", "--no-warnings",
+async def download_audio(url, cid, s0=0.0, e0=None):
+    """Downloads the sound of the video, or only the part between s0 and e0 (seconds)."""
+    sec = ["--download-sections", f"*{int(s0)}-{int(e0) + 1}"] if e0 else []
+    rc, _, err = await _run("yt-dlp", *vod.cookie_args(), "--no-playlist", "--no-warnings", *sec,
                             "-f", "bestaudio/best", "-o", str(CLIP_DIR / f"aud_{cid}.%(ext)s"), "--", url)
+    src = [f for f in CLIP_DIR.glob(f"aud_{cid}.*") if "_part" not in f.name]
+    if rc or not src:
+        raise SmartError("Audio download failed: " + err.strip()[-200:])
+    return src[0]
+
+
+async def whisper_transcript(url, s0=0.0, e0=None):
+    cid = uuid.uuid4().hex[:8]
     try:
-        src = [f for f in CLIP_DIR.glob(f"aud_{cid}.*")]
-        if rc or not src:
-            raise SmartError("Audio download failed: " + err.strip()[-200:])
+        src = [await download_audio(url, cid, s0, e0)]
         rc, _, err = await _run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(src[0]),
                                 "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", "-f", "segment",
                                 "-segment_time", str(CHUNK_SEC), "-reset_timestamps", "1",
@@ -120,7 +130,7 @@ async def whisper_transcript(url):
         segs = []
         for n, p in enumerate(parts):
             data = await asyncio.to_thread(_whisper_file, p)
-            off = n * CHUNK_SEC
+            off = s0 + n * CHUNK_SEC
             for s in data.get("segments") or []:
                 t = (s.get("text") or "").strip()
                 if t:
@@ -167,28 +177,62 @@ async def youtube_captions(url):
             f.unlink(missing_ok=True)
 
 
-async def get_transcript(url, duration, status):
-    long_video = duration > WHISPER_MAX_MIN * 60
-    if not long_video:
+async def sound_scan(url, s0, e0, n, status, ranged=True):
+    """For long parts with no captions: find the hype moments by loudness (free, no AI), then
+    listen closely only to those moments. Uses far less of the free Groq allowance."""
+    cid = uuid.uuid4().hex[:8]
+    try:
+        await status("🔊 Scanning the sound for hype moments (free, no AI)…")
+        audio = await download_audio(url, cid, s0, e0 if ranged else None)
+        scored = vod.surge_scores(await vod.loudness_series(audio))
+        peaks = sorted(t for t, _ in vod.pick_peaks(scored, n, min_gap=SCAN_WIN, skip_start=10))
+        if not peaks:
+            raise SmartError("Couldn't find any standout moments in the sound.")
+        segs = []
+        for k, t in enumerate(peaks, 1):
+            await status(f"🎧 Listening to hype moment {k}/{len(peaks)}…")
+            a = max(0.0, t - SCAN_WIN * 0.55)
+            part = CLIP_DIR / f"aud_{cid}_part{k:03d}.mp3"
+            rc, _, _ = await _run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{a:.1f}",
+                                  "-t", str(SCAN_WIN), "-i", str(audio), "-vn", "-ac", "1", "-ar", "16000",
+                                  "-b:a", "32k", str(part))
+            if rc or not part.exists():
+                continue
+            try:
+                data = await asyncio.to_thread(_whisper_file, part)
+            except SmartError as e:
+                if segs:
+                    break      # free limit reached: keep what we have
+                raise
+            for sg in data.get("segments") or []:
+                txt = (sg.get("text") or "").strip()
+                if txt:
+                    segs.append((s0 + a + float(sg["start"]), s0 + a + float(sg["end"]), txt))
+        return sorted(segs)
+    finally:
+        for f in CLIP_DIR.glob(f"aud_{cid}*"):
+            f.unlink(missing_ok=True)
+
+
+async def get_transcript(url, s0, e0, status, count, ranged=False):
+    span = e0 - s0
+    whole = span <= WHISPER_MAX_MIN * 60
+    if whole:
         try:
             await status("🎧 Listening to the video…")
-            segs = await whisper_transcript(url)
+            segs = await whisper_transcript(url, s0, e0) if ranged else await whisper_transcript(url)
             if segs:
                 return segs, "Whisper"
         except Exception as e:
             log.warning("whisper: %s", e)
-            first_err = str(e)
-        else:
-            first_err = "no speech found"
-    else:
-        first_err = "video longer than the free audio limit"
     await status("📝 Reading YouTube's captions…")
-    segs = await youtube_captions(url)
-    if segs:
+    segs = [x for x in await youtube_captions(url) if s0 <= x[0] < e0]
+    if len(segs) > span / 60 * 3:          # captions that actually cover this part
         return segs, "YouTube captions"
-    if long_video:
-        raise SmartError(f"This video is over {WHISPER_MAX_MIN} minutes and has no captions I can read.")
-    raise SmartError(f"Couldn't get what's said in this video ({first_err}).")
+    segs = await sound_scan(url, s0, e0, max(6, min(24, int(count * 2.5))), status, ranged)
+    if segs:
+        return segs, "sound scan + Whisper"
+    raise SmartError("Couldn't get what's said in this part of the video.")
 
 
 # ───────────── AI ─────────────
@@ -247,11 +291,12 @@ def _windows(lines):
     return out
 
 
-def hot_ranges(meta, dur):
+def hot_ranges(meta, dur, s0=0.0, e0=None):
     """Parts of the video people re-watch most (YouTube's 'Most replayed'), widened a bit.
     Only these parts are sent to the AI, which makes long videos much faster."""
-    heat = meta.get("heatmap") or []
-    if dur < 20 * 60 or len(heat) < 20:
+    e0 = dur if e0 is None else e0
+    heat = [h for h in (meta.get("heatmap") or []) if s0 <= h["start_time"] < e0]
+    if e0 - s0 < 20 * 60 or len(heat) < 10:
         return None
     vals = sorted(h["value"] for h in heat)
     cut = vals[int(len(vals) * 0.55)]
@@ -274,7 +319,7 @@ def pick(meta, vtype, segs, ads, want, allowed=None):
     for i, (s, e, t) in enumerate(segs):
         if allowed is not None and i not in allowed:
             continue
-        if prev >= 0 and i != prev + 1:
+        if prev >= 0 and (i != prev + 1 or s - segs[prev][1] > 8):
             lines.append("--- (part of the video skipped, never join clips across this line) ---")
         prev = i
         if any(_overlap(s, e, a0, a1) > 0.5 * (e - s) for a0, a1, _ in ads):
@@ -322,9 +367,12 @@ def clean(segs, cands, ads, vtype, allowed=None):
     for a, b, sc, why in sorted(cands, key=lambda x: -x[2]):
         if not all(ok(i) for i in range(a, b + 1)):
             continue
+        if any(segs[i + 1][0] - segs[i][1] > 8 for i in range(a, b)):
+            continue          # the clip would jump across a skipped part
         while b > a and segs[b][1] - segs[a][0] > hi + 5:   # too long: end on an earlier sentence
             b -= 1
         while segs[b][1] - segs[a][0] < lo and b + 1 < len(segs) and ok(b + 1) \
+                and segs[b + 1][0] - segs[b][1] <= 8 \
                 and segs[b + 1][1] - segs[a][0] <= hi:      # too short: add the next sentence(s)
             b += 1
         s, e = max(0.0, segs[a][0] - 0.25), segs[b][1] + 0.4
@@ -359,26 +407,35 @@ def write_captions(meta, vtype, clips):
         c["caption"] = str(out.get(n, {}).get("caption") or "")[:600]
 
 
-async def find_clips(url, count, status):
-    """Returns (video_type, transcript_source, [clip dicts]) ready to cut."""
+async def find_clips(url, count, status, start=None, end=None):
+    """Returns (video_type, transcript_source, [clip dicts]) ready to cut. start/end (seconds) limit the
+    work to one part of a long video or stream."""
     _key()
     await status("🔎 Checking the video…")
     meta = await vod.info(url)
     if meta.get("is_live"):
-        raise SmartError("That's a live stream. Send a normal video link.")
+        raise SmartError("That's still live. Wait until the stream has ended, then send the link.")
     dur = float(meta.get("duration") or 0)
-    if not dur or dur > vod.MAX_VIDEO_SECONDS:
-        raise SmartError("Video is too long (max 4 hours).")
-    if dur < 60:
-        raise SmartError("That video is already short. Send a longer one.")
+    if not dur or dur > MAX_VIDEO:
+        raise SmartError("I can't read this video's length, or it's longer than 48 hours.")
+    s0 = max(0.0, start or 0.0)
+    e0 = min(dur, end) if end else dur
+    if e0 - s0 < 60:
+        raise SmartError("That part is shorter than a minute. Check the start and end times.")
+    if e0 - s0 > MAX_RANGE + 60:
+        h = (e0 - s0) / 3600
+        raise SmartError(f"That's {h:.1f} hours. I do up to 4 hours at a time, so use start and end, e.g. "
+                         f"start 0:00 end 4:00:00, then start 4:00:00 end 8:00:00.")
 
-    ads = await asyncio.to_thread(sponsor_segments, meta.get("id") or vod.video_id(url))
-    segs, source = await get_transcript(url, dur, status)
+    ads = [a for a in await asyncio.to_thread(sponsor_segments, meta.get("id") or vod.video_id(url))
+           if a[1] > s0 and a[0] < e0]
+    ranged = s0 > 0 or e0 < dur
+    segs, source = await get_transcript(url, s0, e0, status, count, ranged)
 
     await status("🧠 Working out what kind of video this is…")
     vtype = await asyncio.to_thread(classify, meta, segs)
     await status(f"✂️ Finding the best **{vtype}** moments (skipping {len(ads)} ad/intro parts)…")
-    hot = hot_ranges(meta, dur)
+    hot = hot_ranges(meta, dur, s0, e0)
     allowed = None
     if hot:
         allowed = {i for i, (s, e, _) in enumerate(segs) if any(a <= s <= b for a, b in hot)}
