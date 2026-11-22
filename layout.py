@@ -76,7 +76,7 @@ def sample(path):
                 break
             small = cv2.resize(frame, None, fx=scale, fy=scale) if scale != 1.0 else frame
             faces = [(x / scale, y / scale, w / scale, h / scale) for x, y, w, h in det(small)]
-            faces = [f for f in faces if f[2] >= W * 0.035]
+            faces = [f for f in faces if f[2] >= W * 0.02]
             out.append((i / fps, faces))
             if _caption_text(cv2.resize(small, (640, max(2, int(640 * H / W))))):
                 present += 1
@@ -135,8 +135,9 @@ def _track_moves(samples, W, H, flip):
     return cw, x0, moves
 
 
-def analyze(path, vtype="", flip=False):
-    """Returns a dict describing the layout. Never raises: falls back to 'fit'."""
+def analyze(path, vtype="", flip=False, gaming=True):
+    """Returns a dict describing the layout. Never raises: falls back to 'fit'.
+    gaming=False: never use the facecam-on-top layout."""
     try:
         W, H, samples, burned = sample(path)
     except Exception as e:
@@ -156,9 +157,11 @@ def analyze(path, vtype="", flip=False):
     def mirror(c):
         return dict(c, cx=W - c["cx"]) if flip else c
 
-    cam = [c for c in cl if c["w"] < W * 0.11 and (c["cx"] < W * 0.33 or c["cx"] > W * 0.67)
-           and (c["cy"] < H * 0.4 or c["cy"] > H * 0.6)]
-    if cam and (vtype == "gaming" or len(cl) == 1):
+    # A facecam: a small face near the left/right side or the top/bottom edge of the frame.
+    cam = [c for c in cl if c["w"] < W * 0.11 and (c["cx"] < W * 0.33 or c["cx"] > W * 0.67
+                                                   or c["cy"] < H * 0.3 or c["cy"] > H * 0.7)]
+    big_faces = [c for c in cl if c["w"] >= W * 0.11]
+    if gaming and cam and (vtype == "gaming" or not big_faces):
         info.update(layout="gaming", cam=mirror(cam[0]))
         return info
 
@@ -207,8 +210,8 @@ def filter_for(info, src, remap=lambda t: t):
         a = _person_crop(info["top"], W, H, OUT_W / (OUT_H / 2), 0.55, mw)   # lower, so the title fits above
         b = _person_crop(info["bottom"], W, H, OUT_W / (OUT_H / 2), 0.42, mw)
         f = (f"[{src}]split[p1][p2];"
-             f"[p1]crop={a[0]}:{a[1]}:{a[2]}:{a[3]},scale={OUT_W}:{OUT_H // 2},setsar=1[t1];"
-             f"[p2]crop={b[0]}:{b[1]}:{b[2]}:{b[3]},scale={OUT_W}:{OUT_H // 2},setsar=1[t2];"
+             f"[p1]crop={a[0]}:{a[1]}:{a[2]}:{a[3]},scale={OUT_W}:{OUT_H // 2}:flags=lanczos,setsar=1[t1];"
+             f"[p2]crop={b[0]}:{b[1]}:{b[2]}:{b[3]},scale={OUT_W}:{OUT_H // 2}:flags=lanczos,setsar=1[t2];"
              f"[t1][t2]vstack,setsar=1[vs]")
         return f, {"cap_y": OUT_H // 2, "title_y": 95, "title_box": True}
     if lay == "gaming":
@@ -222,8 +225,8 @@ def filter_for(info, src, remap=lambda t: t):
         gw = min(W, gh * OUT_W / (OUT_H - top_h))
         gx = (W - gw) / 2
         f = (f"[{src}]split[p1][p2];"
-             f"[p1]crop={_even(cw)}:{_even(ch)}:{_even(cx)}:{_even(cy)},scale={OUT_W}:{top_h},setsar=1[t1];"
-             f"[p2]crop={_even(gw)}:{_even(gh)}:{_even(gx)}:0,scale={OUT_W}:{OUT_H - top_h},setsar=1[t2];"
+             f"[p1]crop={_even(cw)}:{_even(ch)}:{_even(cx)}:{_even(cy)},scale={OUT_W}:{top_h}:flags=lanczos,setsar=1,format=yuv420p,unsharp=5:5:0.6:5:5:0[t1];"
+             f"[p2]crop={_even(gw)}:{_even(gh)}:{_even(gx)}:0,scale={OUT_W}:{OUT_H - top_h}:flags=lanczos,setsar=1,format=yuv420p[t2];"
              f"[t1][t2]vstack,setsar=1[vs]")
         return f, {"cap_y": top_h, "title_y": 90, "title_box": True}
     if lay == "track":
@@ -236,7 +239,7 @@ def filter_for(info, src, remap=lambda t: t):
             parts.append(f"({d})*clip((t-{t2:.2f})/{dur},0,1)")
         x = "+".join(parts)
         f = (f"[{src}]crop=w={cw}:h={_even(H)}:x='min(max({x},0),{W - cw})':y=0,"
-             f"scale={OUT_W}:{OUT_H},setsar=1[vs]")
+             f"scale={OUT_W}:{OUT_H}:flags=lanczos,setsar=1[vs]")
         return f, {"cap_y": int(OUT_H * 0.70), "title_y": 150, "title_box": True}
     if lay == "vertical":
         return (f"[{src}]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease,"
@@ -245,6 +248,6 @@ def filter_for(info, src, remap=lambda t: t):
     vid_h = int(OUT_W * H / W) // 2 * 2
     f = (f"[{src}]split[a][b];"
          f"[a]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,crop={OUT_W}:{OUT_H},boxblur=30:5[bg];"
-         f"[b]scale={OUT_W}:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[vs]")
+         f"[b]scale={OUT_W}:-2:flags=lanczos[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[vs]")
     band = (OUT_H - vid_h) // 2
     return f, {"cap_y": min(OUT_H - band + 90, int(OUT_H * 0.78)), "title_y": band // 2, "title_box": False}
