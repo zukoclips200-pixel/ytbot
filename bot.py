@@ -7,7 +7,7 @@ from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
-import editor, smart, vod
+import captions, editor, smart, vod
 from db import DB
 
 load_dotenv()
@@ -68,6 +68,7 @@ class EditView(discord.ui.View):
         self.game_btn.label = f"🎮 Gaming layout: {self.o.gaming}"
         self.game_btn.style = (discord.ButtonStyle.success if self.o.gaming == "auto"
                                else discord.ButtonStyle.secondary)
+        self.style_sel.placeholder = f"Caption colour: {captions.CAPTION_STYLES[self.o.cap_style][0]}"
 
     @discord.ui.select(row=0, placeholder="Size",
                        options=[discord.SelectOption(label=v[0], value=k) for k, v in editor.SIZES.items()])
@@ -80,6 +81,14 @@ class EditView(discord.ui.View):
                        options=[discord.SelectOption(label=v[0], value=k) for k, v in editor.COLORS.items()])
     async def color_sel(self, interaction, select):
         self.o.color = select.values[0]
+        self.sync()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.select(row=4, placeholder="Caption colour",
+                       options=[discord.SelectOption(label=v[0], value=k)
+                                for k, v in captions.CAPTION_STYLES.items()])
+    async def style_sel(self, interaction, select):
+        self.o.cap_style = select.values[0]
         self.sync()
         await interaction.response.edit_message(view=self)
 
