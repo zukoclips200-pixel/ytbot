@@ -47,6 +47,7 @@ class EditOpts:
     captions: str = "auto"  # auto = skip if the video already has captions burned in
     vtype: str = ""         # podcast / gaming / ... from the AI, helps pick the layout
     gaming: str = "auto"    # auto = streamer on top + gameplay below when a webcam is found; off = never
+    cap_style: str = "classic"  # caption colours (see captions.CAPTION_STYLES)
 
 
 async def _run(*args):
@@ -183,7 +184,7 @@ async def autoedit(src: Path, dst: Path, o: EditOpts, overlay_path: Path | None 
     if words or o.title.strip():
         ass_file = dst.with_suffix(".ass")
         captions.build_ass(ass_file, W, H, words, place["cap_y"], o.title, place["title_y"],
-                           place["title_box"], out_len)
+                           place["title_box"], out_len, style=o.cap_style)
         fc.append(f"[{cur}]ass=filename='{ass_file}'[vt]")
         cur = "vt"
 
