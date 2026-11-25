@@ -1,9 +1,11 @@
 """Clip regular YouTube videos: yt-dlp (download only the needed section) + ffmpeg."""
-import asyncio, json, os, re, statistics, uuid
+import asyncio, json, logging, os, re, statistics, uuid
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 import clipper, editor
+
+log = logging.getLogger("vod")
 
 CLIP_DIR = clipper.CLIP_DIR
 MAX_CLIP = 90
@@ -42,8 +44,13 @@ def save_cookies(text: str) -> int:
     return count
 
 
+_SKIP_COOKIES = False      # set when the saved cookies stop working (YouTube then shows no video formats)
+
+
 def cookie_args():
     """Uses cookies from /ytcookies, or from a YT_COOKIES variable on Railway, as a YouTube login."""
+    if _SKIP_COOKIES:
+        return []
     if not COOKIE_FILE.exists():
         c = os.getenv("YT_COOKIES", "").strip()
         if not c or not save_cookies(c):
@@ -89,11 +96,33 @@ def fmt_ts(t: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-async def info(url: str) -> dict:
-    rc, out, err = await _run("yt-dlp", *cookie_args(), "--dump-single-json", "--no-warnings", "--no-playlist", "--", url)
+async def _info_once(url, cookies):
+    args = cookie_args() if cookies else []
+    rc, out, err = await _run("yt-dlp", *args, "--dump-single-json", "--no-warnings", "--no-playlist",
+                              "--ignore-no-formats-error", "--", url)
     if rc:
-        raise RuntimeError("Couldn't read that video: " + err.strip()[-200:])
-    return json.loads(out)
+        return None, err
+    d = json.loads(out)
+    ok = any(f.get("vcodec") not in (None, "none") or f.get("acodec") not in (None, "none")
+             for f in d.get("formats") or [])
+    return (d if ok else None), (err or "YouTube gave no video formats") if not ok else ""
+
+
+async def info(url: str) -> dict:
+    """Video details. If YouTube shows no video with the saved cookies (they expired or got flagged),
+    it tries again without them and stops using them until the bot restarts."""
+    global _SKIP_COOKIES
+    d, err = await _info_once(url, True)
+    if d:
+        return d
+    if cookie_args():
+        d2, err2 = await _info_once(url, False)
+        if d2:
+            _SKIP_COOKIES = True
+            log.warning("saved YouTube cookies stopped working, continuing without them")
+            return d2
+        err = err2 or err
+    raise RuntimeError("Couldn't read that video: " + err.strip()[-200:])
 
 
 async def shrink(src: Path, dst: Path, limit_mb: float):
@@ -214,5 +243,5 @@ async def find_moments(url: str, count: int):
         s = max(0.0, t - CLIP_LEN / 2)
         e = min(dur, s + CLIP_LEN)
         s = max(0.0, e - CLIP_LEN)
-        moments.append((s, e, why))
+        moments.append((s, e, why)
     return moments, method
