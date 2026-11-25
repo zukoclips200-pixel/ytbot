@@ -243,5 +243,5 @@ async def find_moments(url: str, count: int):
         s = max(0.0, t - CLIP_LEN / 2)
         e = min(dur, s + CLIP_LEN)
         s = max(0.0, e - CLIP_LEN)
-        moments.append((s, e, why)
+                moments.append((s, e, why))
     return moments, method
