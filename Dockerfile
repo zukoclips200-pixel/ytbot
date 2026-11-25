@@ -7,4 +7,5 @@ ADD https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-CMD ["python", "bot.py"]
+# YouTube changes things often: get the newest yt-dlp every time the bot starts
+CMD ["sh", "-c", "pip install -q --no-cache-dir -U --pre 'yt-dlp[default]' || true; python bot.py"]
